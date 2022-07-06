@@ -10,14 +10,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 )
 
 var (
 	listen                = flag.String("l", ":8080", "listen address")
+	metricsListen         = flag.String("m", ":8081", "listen address")
 	tokenValidityDuration = flag.Int("t", 60, "token validity duration in minutes")
 	tokenValidationWait   = flag.Int("w", 60, "how long to wait for a token to be validated before deleting it in seconds")
 	verbose               = flag.Bool("v", false, "enable verbose logging")
+)
+
+var (
+	metricIssuedTokens = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "httpgate_issued_tokens",
+		Help: "Issued HTTPGate tokens",
+	})
+	metricValidatedTokens = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "httpgate_validated_tokens",
+		Help: "Validated HTTPGate tokens",
+	})
 )
 
 type cacheEntry struct {
@@ -50,11 +65,14 @@ func validate(token, hash string) bool {
 		return false
 	}
 	entry.validated = true
+	metricValidatedTokens.Inc()
 
 	// Check if server hash is expired
 	if time.Now().After(entry.created.Add(time.Duration(*tokenValidityDuration) * time.Minute)) {
 		log.Debugf("Server hash %s expired, removing from cache", hash)
 		delete(cache, hash)
+		metricIssuedTokens.Dec()
+		metricValidatedTokens.Dec()
 		return false
 	}
 
@@ -80,6 +98,8 @@ func main() {
 				if !entry.validated && time.Now().After(entry.created.Add(time.Duration(*tokenValidationWait)*time.Second)) {
 					log.Debugf("Purging expired server hash %s", hash)
 					delete(cache, hash)
+					metricIssuedTokens.Dec()
+					metricValidatedTokens.Dec()
 				}
 			}
 		}
@@ -94,7 +114,7 @@ func main() {
 		if validate(token, hash) {
 			log.Debugf("Valid token %s for hash %s", token, hash)
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("OK"))
+			_, _ = w.Write([]byte("OK"))
 		} else {
 			log.Debugf("Invalid token %s for hash %s", token, hash)
 			w.WriteHeader(http.StatusUnauthorized)
@@ -107,27 +127,35 @@ func main() {
 		if err != nil {
 			log.Println(err)
 			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("Error"))
+			_, _ = w.Write([]byte("Error"))
 			return
 		}
 		cache[newHash] = &cacheEntry{
 			created:   time.Now(),
 			validated: false,
 		}
+		metricIssuedTokens.Inc()
 		log.Debugf("Generated new hash %s", newHash)
-		w.Write([]byte(newHash))
+		_, _ = w.Write([]byte(newHash))
 	})
 
 	http.HandleFunc("/invalidate", func(w http.ResponseWriter, r *http.Request) {
 		log.Debug("Invalidating all hashes")
 		cache = make(map[string]*cacheEntry)
+		metricIssuedTokens.Set(0)
+		metricValidatedTokens.Set(0)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK"))
 	})
 
+	// Metrics server
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	log.Infof("Starting metrics exporter on http://%s/metrics", *metricsListen)
+	go func() {
+		log.Fatal(http.ListenAndServe(*metricsListen, metricsMux))
+	}()
+
 	log.Printf("Starting httpgate token broker on %s", *listen)
-	err := http.ListenAndServe(*listen, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
+	log.Fatal(http.ListenAndServe(*listen, nil))
 }

@@ -65,14 +65,11 @@ func validate(token, hash string) bool {
 		return false
 	}
 	entry.validated = true
-	metricValidatedTokens.Inc()
 
 	// Check if server hash is expired
 	if time.Now().After(entry.created.Add(time.Duration(*tokenValidityDuration) * time.Minute)) {
 		log.Debugf("Server hash %s expired, removing from cache", hash)
 		delete(cache, hash)
-		metricIssuedTokens.Dec()
-		metricValidatedTokens.Dec()
 		return false
 	}
 
@@ -98,10 +95,22 @@ func main() {
 				if !entry.validated && time.Now().After(entry.created.Add(time.Duration(*tokenValidationWait)*time.Second)) {
 					log.Debugf("Purging expired server hash %s", hash)
 					delete(cache, hash)
-					metricIssuedTokens.Dec()
-					metricValidatedTokens.Dec()
 				}
 			}
+		}
+	}()
+
+	metricUpdateTicker := time.NewTicker(1 * time.Second)
+	go func() {
+		for range metricUpdateTicker.C {
+			metricIssuedTokens.Set(float64(len(cache)))
+			validated := 0
+			for _, token := range cache {
+				if token.validated {
+					validated++
+				}
+			}
+			metricValidatedTokens.Set(float64(validated))
 		}
 	}()
 
@@ -134,7 +143,6 @@ func main() {
 			created:   time.Now(),
 			validated: false,
 		}
-		metricIssuedTokens.Inc()
 		log.Debugf("Generated new hash %s", newHash)
 		_, _ = w.Write([]byte(newHash))
 	})
@@ -142,8 +150,6 @@ func main() {
 	http.HandleFunc("/invalidate", func(w http.ResponseWriter, r *http.Request) {
 		log.Debug("Invalidating all hashes")
 		cache = make(map[string]*cacheEntry)
-		metricIssuedTokens.Set(0)
-		metricValidatedTokens.Set(0)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})

@@ -73,7 +73,7 @@ func validate(token, hash string) bool {
 		return false
 	}
 
-	return strings.HasSuffix(sha256hash(hash+token), "000")
+	return strings.HasSuffix(sha256hash(hash+token), "0000")
 }
 
 func sha256hash(s string) string {
